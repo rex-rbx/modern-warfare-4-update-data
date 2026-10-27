@@ -1,0 +1,112 @@
+name: Update MW4 Data & Deploy to Pages
+
+on:
+  schedule:
+    - cron: '0 0 */3 * *'
+  workflow_dispatch:
+    inputs:
+      force_steam_check:
+        description: 'Force Steam check to report an update (bypass signature comparison)'
+        type: boolean
+        default: false
+      force_deploy:
+        description: 'Force Pages deploy even if no data changed'
+        type: boolean
+        default: true
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Log trigger context
+        run: |
+          echo "Trigger event: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "force_steam_check: ${{ inputs.force_steam_check }}"
+            echo "force_deploy:      ${{ inputs.force_deploy }}"
+          fi
+      - name: Check for Steam Updates
+        id: steam_check
+        env:
+          FORCE: ${{ inputs.force_steam_check }}
+        run: |
+          mkdir -p public/api .state
+          APPID=4435490
+          FORCE="${FORCE:-false}"
+          echo "Force mode: $FORCE"
+
+          curl -fsSL "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${APPID}&count=1&maxlength=0" \
+            -o steam_news_raw.json || { echo "Steam fetch failed"; echo "changed=false" >> $GITHUB_OUTPUT; exit 0; }
+
+          SIGNATURE=$(jq -r '.appnews.newsitems[0] | "\(.gid)-\(.date)"' steam_news_raw.json)
+          echo "Latest Steam signature: $SIGNATURE"
+
+          PREV_FILE=".state/steam_signature.txt"
+          PREV=""
+          [ -f "$PREV_FILE" ] && PREV=$(cat "$PREV_FILE")
+
+          if [ "$SIGNATURE" != "$PREV" ] || [ "$FORCE" = "true" ]; then
+            echo "Steam update detected (or forced)."
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "forced=$([ "$FORCE" = "true" ] && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "$SIGNATURE" > "$PREV_FILE"
+            jq '.appnews.newsitems[0]' steam_news_raw.json > public/api/steam_latest_news.json
+          else
+            echo "No Steam change since last run."
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "forced=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Fetch MW4 API Data
+        run: |
+          mkdir -p public/api
+          fetch_and_save() {
+            local url="$1"
+            local filename="$2"
+            echo "Fetching $url -> $filename"
+            curl -fsSL "$url" -o "public/api/$filename" || echo "Warning: Failed to fetch $url"
+          }
+          fetch_and_save "https://api.mw4.gg/api/v2/camos?sort=name&limit=100&page=1" "camos_page1.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/camos?sort=name&limit=100&page=2" "camos_page2.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/camo-grind" "camo_grind.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/game-versions?limit=100" "game_versions.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/meta/rankings?category=weapons&role=overall&gameVersion=launch&sort=rating-desc&limit=100" "meta_launch_rating.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/meta/rankings?category=weapons&role=overall&sort=name-asc&limit=100&gameVersion=early-access-beta" "meta_ea_name.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/meta/rankings?category=weapons&role=overall&sort=name-asc&limit=100&gameVersion=launch" "meta_launch_name.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/meta/rankings?category=weapons&role=overall&gameVersion=current&sort=rating-desc&limit=100" "meta_current_rating.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/meta/rankings?category=weapons&role=overall&gameVersion=early-access-beta&sort=rating-desc&limit=100" "meta_ea_rating.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/weapons/iso-nightshade/ratings?role=overall&granularity=day" "iso_nightshade_ratings.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/weapons?view=catalog&isActive=true&sort=name&limit=100&gameVersion=launch" "weapons_catalog_launch.json"
+      - name: Persist Steam signature
+        if: steps.steam_check.outputs.changed == 'true' && steps.steam_check.outputs.forced != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .state/steam_signature.txt
+          git commit -m "chore: record MW4 steam update [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: Upload artifact for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
