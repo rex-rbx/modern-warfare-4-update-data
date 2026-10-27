@@ -1,4 +1,4 @@
-name: Update MW4 Data & Deploy to Pages
+name: Update MW4 Data
 
 on:
   schedule:
@@ -9,38 +9,36 @@ on:
         description: 'Force Steam check to report an update (bypass signature comparison)'
         type: boolean
         default: false
-      force_deploy:
-        description: 'Force Pages deploy even if no data changed'
-        type: boolean
-        default: true
+
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: write   # needed to commit data back to the repo
+
 concurrency:
-  group: "pages"
+  group: "mw4-data"
   cancel-in-progress: false
+
 jobs:
-  build:
+  update:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+
       - name: Log trigger context
         run: |
           echo "Trigger event: ${{ github.event_name }}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "force_steam_check: ${{ inputs.force_steam_check }}"
-            echo "force_deploy:      ${{ inputs.force_deploy }}"
           fi
+
       - name: Check for Steam Updates
         id: steam_check
         env:
           FORCE: ${{ inputs.force_steam_check }}
         run: |
-          mkdir -p public/api .state
+          mkdir -p data .state
           APPID=4435490
           FORCE="${FORCE:-false}"
           echo "Force mode: $FORCE"
@@ -58,23 +56,24 @@ jobs:
           if [ "$SIGNATURE" != "$PREV" ] || [ "$FORCE" = "true" ]; then
             echo "Steam update detected (or forced)."
             echo "changed=true" >> $GITHUB_OUTPUT
-            echo "forced=$([ "$FORCE" = "true" ] && echo true || echo false)" >> $GITHUB_OUTPUT
             echo "$SIGNATURE" > "$PREV_FILE"
-            jq '.appnews.newsitems[0]' steam_news_raw.json > public/api/steam_latest_news.json
+            jq '.appnews.newsitems[0]' steam_news_raw.json > data/steam_latest_news.json
           else
             echo "No Steam change since last run."
             echo "changed=false" >> $GITHUB_OUTPUT
-            echo "forced=false" >> $GITHUB_OUTPUT
           fi
+
       - name: Fetch MW4 API Data
         run: |
-          mkdir -p public/api
+          mkdir -p data
+
           fetch_and_save() {
             local url="$1"
             local filename="$2"
             echo "Fetching $url -> $filename"
-            curl -fsSL "$url" -o "public/api/$filename" || echo "Warning: Failed to fetch $url"
+            curl -fsSL "$url" -o "data/$filename" || echo "Warning: Failed to fetch $url"
           }
+
           fetch_and_save "https://api.mw4.gg/api/v2/camos?sort=name&limit=100&page=1" "camos_page1.json"
           fetch_and_save "https://api.mw4.gg/api/v2/camos?sort=name&limit=100&page=2" "camos_page2.json"
           fetch_and_save "https://api.mw4.gg/api/v2/camo-grind" "camo_grind.json"
@@ -86,27 +85,24 @@ jobs:
           fetch_and_save "https://api.mw4.gg/api/v2/meta/rankings?category=weapons&role=overall&gameVersion=early-access-beta&sort=rating-desc&limit=100" "meta_ea_rating.json"
           fetch_and_save "https://api.mw4.gg/api/v2/weapons/iso-nightshade/ratings?role=overall&granularity=day" "iso_nightshade_ratings.json"
           fetch_and_save "https://api.mw4.gg/api/v2/weapons?view=catalog&isActive=true&sort=name&limit=100&gameVersion=launch" "weapons_catalog_launch.json"
-      - name: Persist Steam signature
-        if: steps.steam_check.outputs.changed == 'true' && steps.steam_check.outputs.forced != 'true'
+
+      - name: Commit and push data changes
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .state/steam_signature.txt
-          git commit -m "chore: record MW4 steam update [skip ci]" || echo "Nothing to commit"
+
+          git add data .state
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          # Build a descriptive commit message
+          MSG="chore(data): refresh MW4 data"
+          if [ "${{ steps.steam_check.outputs.changed }}" = "true" ]; then
+            MSG="$MSG + steam update"
+          fi
+
+          git commit -m "$MSG [skip ci]"
           git push
-
-      - name: Upload artifact for Pages
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
