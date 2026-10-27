@@ -90,8 +90,17 @@ jobs:
           fi
           MSG="chore(data): refresh MW4 data"
           if [ "${{ steps.steam_check.outputs.changed }}" = "true" ]; then
-            MSG="$MSG + activision news"
+            MSG="$MSG + steam update"
           fi
-
           git commit -m "$MSG [skip ci]"
-          git push
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          for i in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed on attempt $i."
+              exit 0
+            fi
+            echo "Push failed on attempt $i, re-syncing..."
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          done
+          echo "Push failed after retries." >&2
+          exit 1
