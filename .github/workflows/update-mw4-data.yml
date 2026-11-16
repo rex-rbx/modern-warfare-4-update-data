@@ -20,6 +20,8 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # Generous timeout since we have unlimited public repo minutes. Let the API think.
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -43,20 +45,19 @@ jobs:
           FORCE="${FORCE:-false}"
           echo "Force mode: $FORCE"
 
-          # Fetch recent news from the main Call of Duty app
-          curl -fsSL "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${APPID}&count=30&maxlength=0" \
+          # Fetch recent news with retries
+          curl -fsSL --retry 3 --retry-delay 5 "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${APPID}&count=30&maxlength=0" \
             -o steam_news_raw.json || { echo "Steam fetch failed"; echo "changed=false" >> $GITHUB_OUTPUT; exit 0; }
 
-          # Filter: official Steam announcements whose title mentions Modern Warfare 4
+          # Broader Regex to catch MW4, Modern Warfare 4, or MWIII
           jq '[.appnews.newsitems[]
                 | select(.feedname == "steam_community_announcements")
-                | select(.title | test("Modern Warfare 4"; "i"))]
+                | select(.title | test("Modern Warfare 4|MW4|MWIII"; "i"))]
               | sort_by(.date)
               | reverse
               | .[0]' \
             steam_news_raw.json > steam_news_filtered.json
 
-          # Bail out if nothing matched
           if jq -e '. == null' steam_news_filtered.json > /dev/null 2>&1; then
             echo "No official Modern Warfare 4 announcement found in the COD feed."
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -75,6 +76,14 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "$SIGNATURE" > "$PREV_FILE"
             cp steam_news_filtered.json data/steam_latest_news.json
+            
+            # Extract the URL and Title for the Discord Webhook
+            NEWS_URL=$(jq -r '.url' steam_news_filtered.json)
+            echo "news_url=$NEWS_URL" >> $GITHUB_OUTPUT
+            
+            # Escape double quotes in title for JSON safety
+            NEWS_TITLE=$(jq -r '.title' steam_news_filtered.json | sed 's/"/\\"/g')
+            echo "news_title=$NEWS_TITLE" >> $GITHUB_OUTPUT
           else
             echo "No Modern Warfare 4 news change since last run."
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -88,9 +97,12 @@ jobs:
             local url="$1"
             local filename="$2"
             echo "Fetching $url -> $filename"
-            curl -fsSL "$url" -o "data/$filename" || echo "Warning: Failed to fetch $url"
+            # Added --retry for resilience against API hiccups
+            curl -fsSL --retry 3 --retry-delay 5 "$url" -o "data/$filename" || echo "Warning: Failed to fetch $url"
+            sleep 1 # Polite 1-second delay to avoid rate limiting
           }
 
+          # Existing core endpoints
           fetch_and_save "https://api.mw4.gg/api/v2/camos?sort=name&limit=100&page=1" "camos_page1.json"
           fetch_and_save "https://api.mw4.gg/api/v2/camos?sort=name&limit=100&page=2" "camos_page2.json"
           fetch_and_save "https://api.mw4.gg/api/v2/camo-grind" "camo_grind.json"
@@ -102,6 +114,26 @@ jobs:
           fetch_and_save "https://api.mw4.gg/api/v2/meta/rankings?category=weapons&role=overall&gameVersion=early-access-beta&sort=rating-desc&limit=100" "meta_ea_rating.json"
           fetch_and_save "https://api.mw4.gg/api/v2/weapons/iso-nightshade/ratings?role=overall&granularity=day" "iso_nightshade_ratings.json"
           fetch_and_save "https://api.mw4.gg/api/v2/weapons?view=catalog&isActive=true&sort=name&limit=100&gameVersion=launch" "weapons_catalog_launch.json"
+          
+          # New expanded endpoints
+          fetch_and_save "https://api.mw4.gg/api/v2/operators?limit=100" "operators.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/operator-skins?limit=100" "operator_skins.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/maps?limit=100" "maps.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/perks?limit=100" "perks.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/tacticals?limit=100" "tacticals.json"
+          fetch_and_save "https://api.mw4.gg/api/v2/lethals?limit=100" "lethals.json"
+
+      - name: Validate JSON
+        run: |
+          echo "Validating JSON files..."
+          for file in data/*.json; do
+            if ! jq empty "$file" > /dev/null 2>&1; then
+              echo "Error: $file is not valid JSON!"
+              rm "$file" # Remove the invalid file so we don't commit garbage
+              exit 1
+            fi
+          done
+          echo "All JSON files are valid."
 
       - name: Commit and push data changes
         run: |
@@ -133,3 +165,21 @@ jobs:
 
           echo "Push failed after retries." >&2
           exit 1
+
+      # Optional: Send Discord Webhook if Steam News changed
+      - name: Discord Notification
+        if: steps.steam_check.outputs.changed == 'true'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "No Discord webhook secret configured. Skipping."
+            exit 0
+          fi
+          
+          TITLE="${{ steps.steam_check.outputs.news_title }}"
+          URL="${{ steps.steam_check.outputs.news_url }}"
+          
+          curl -fsSL -H "Content-Type: application/json" \
+            -d "{\"content\": \"🚨 **New MW4 Official Update!**\n**$TITLE**\n$URL\"}" \
+            "$DISCORD_WEBHOOK"
